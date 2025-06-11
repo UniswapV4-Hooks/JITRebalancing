@@ -6,12 +6,16 @@ import {PoolId} from "v4-core/types/PoolId.sol";
 import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
 import {LiquidityAmounts} from "v4-periphery/src/libraries/LiquidityAmounts.sol";
 import {TickMath} from "v4-core/libraries/TickMath.sol";
-
+import {TickBitmap} from "v4-core/libraries/TickBitmap.sol";
+import "v4-core/types/BeforeSwapDelta.sol";
+import {NonzeroDeltaCount} from "v4-core/libraries/NonzeroDeltaCount.sol";
 contract JITHook is BaseHook {
     using StateLibrary for IPoolManager;
     using LiquidityAmounts for uint160;
     using TickMath for *;
-
+    using TickBitmap for *;
+    using BeforeSwapDeltaLibrary for *;
+    using NonzeroDeltaCount for *;
     constructor(IPoolManager _manager) BaseHook(_manager) {}
 
     function getHookPermissions()
@@ -38,6 +42,13 @@ contract JITHook is BaseHook {
                 afterRemoveLiquidityReturnDelta: false
             });
     }
+
+    event JITLiquidityDeltas(
+        int128 indexed liquidity0,
+        int128 indexed liquidity1,
+        int128 feesAccrued0,
+        int128 feesAccrued1
+    );
     function beforeSwap(
         address sender,
         PoolKey calldata key,
@@ -58,48 +69,84 @@ contract JITHook is BaseHook {
         );
         if (params.zeroForOne) {
             // I am swapping token0 for token1
-            // I am specifying amount0:
-            // if amountSpecified <0:
-            //      I am specifying the amount
-            //      of token0 I will deposit(sell)
+            // I am specifying amountSpecified= amount0ToBe...:
             if (params.amountSpecified < 0) {
-                uint256 amount0ToDeposit = uint256(-params.amountSpecified);
+                //      I am specifying the amount0ToBeSold
+                uint256 amount0ToBeSold = uint256(-params.amountSpecified);
                 // If this is the case
-                // because I will be selling amount0ToDeposit
-                // Then the trade can only move the price down
-                // then sqrtPricex96 will be the upperBound
+                // because I will be selling amount0ToBeSold to the AMM
+                // then the AMM is quoting P_1/0 how much of token1
+                // does the AMM give in exchange for amount0ToBeSold
+                // This means that, then the amount of reserves of token0
+                // will increase and token1 will decrease leading
+                // to PRICE GOING DOWN
+                // If price goes down the upper bound is the current price
                 uint160 sqrtPriceX96UpperBound = sqrtPriceX96;
-                // therefore the slippage the trader specified
-                // is the lower bound
+                // Now the JIT will provide liquidity for the whole trade
+                // then he/she sets the sqrtPriceX96UpperBound to the
+                // sqrtPriceLimitX96 specified by the trader
                 uint160 sqrtPriceX96LowerBound = params.sqrtPriceLimitX96;
-                // With this I can get the amount of
-                // liquidity received for amount0ToDeposit
-                uint128 liquidityForTrade = sqrtPriceX96LowerBound
-                    .getLiquidityForAmount0(
-                        sqrtPriceX96UpperBound,
-                        amount0ToDeposit
-                    );
-                // Given this liquidityForTrade I need the
-                // equivalent uint256 liquidityDelta that
-                // fits on the modifyLiquidityParams
-                // How do I go from uint128 liquidity
-                // to uint256 liquidityDelta?
-                int256 validLiquidityDelta = int256(uint256(liquidityForTrade));
                 // Finaly I just need th valid tickLower
                 // and valid tickUpper for the modifyLiquidityParams
+
+                // Validate the ticks are consistent
+                // with the tickSpacing specified on the pool initialization
+
                 (int24 tickLower, int24 tickUpper) = (
-                    sqrtPriceX96LowerBound.getTickAtSqrtPrice(),
-                    sqrtPriceX96UpperBound.getTickAtSqrtPrice()
+                    sqrtPriceX96LowerBound.getTickAtSqrtPrice().compress(
+                        key.tickSpacing
+                    ) *
+                        key.tickSpacing -
+                        key.tickSpacing,
+                    sqrtPriceX96UpperBound.getTickAtSqrtPrice().compress(
+                        key.tickSpacing
+                    ) * key.tickSpacing
                 );
-                poolManager.modifyLiquidity(
-                    key,
-                    ModifyLiquidityParams({
-                        tickLower: tickLower,
-                        tickUpper: tickUpper,
-                        liquidityDelta: validLiquidityDelta,
-                        salt: 0
-                    }),
-                    ""
+                // If ticks range on edges they need to take the max and
+                //min tick allowed on the pool
+                //This is:
+
+                if (tickLower <= TickMath.MIN_TICK) {
+                    tickLower = key.tickSpacing.minUsableTick();
+                }
+                if (tickUpper >= TickMath.MAX_TICK) {
+                    tickUpper = key.tickSpacing.maxUsableTick();
+                }
+                // With this I can get the amount of
+                // liquidity received for amount0ToDeposit
+                int256 liquidityForTrade = int256(
+                    uint256(
+                        sqrtPriceX96LowerBound.getLiquidityForAmount0(
+                            sqrtPriceX96UpperBound,
+                            amount0ToBeSold
+                        )
+                    )
+                );
+
+                (
+                    BalanceDelta callerDelta,
+                    BalanceDelta feesAccrued
+                ) = poolManager.modifyLiquidity(
+                        key,
+                        ModifyLiquidityParams({
+                            tickLower: tickLower,
+                            tickUpper: tickUpper,
+                            liquidityDelta: liquidityForTrade,
+                            salt: 0
+                        }),
+                        ""
+                    );
+                emit JITLiquidityDeltas(
+                    callerDelta.amount0(),
+                    callerDelta.amount1(),
+                    feesAccrued.amount0(),
+                    feesAccrued.amount1()
+                );
+
+                return (
+                    IHooks.beforeSwap.selector,
+                    toBeforeSwapDelta(int128(0), int128(0)),
+                    0
                 );
                 // There is information that needs to reside on tstorage
                 // becuase we need it for the afterSwap to withdraw liquidity
